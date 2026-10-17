@@ -22,6 +22,7 @@ logging.basicConfig(
 def init_db():
     conn = sqlite3.connect("radar_privado.db")
     c = conn.cursor()
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             telegram_id INTEGER PRIMARY KEY,
@@ -50,6 +51,7 @@ def init_db():
             UNIQUE(de_id, para_id)
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS intereses_diarios (
             telegram_id INTEGER,
@@ -58,6 +60,16 @@ def init_db():
             PRIMARY KEY (telegram_id, fecha)
         )
     """)
+
+    # Nueva tabla para chats activos
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats_activos (
+            user_id INTEGER PRIMARY KEY,
+            con_quien INTEGER,
+            fecha TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -156,7 +168,6 @@ def puede_enviar_interes(telegram_id):
     return True
 
 def obtener_interesados(telegram_id):
-    """Devuelve la lista de personas que marcaron interés a este usuario"""
     conn = sqlite3.connect("radar_privado.db")
     c = conn.cursor()
     c.execute("""
@@ -164,12 +175,49 @@ def obtener_interesados(telegram_id):
         FROM intereses i
         JOIN usuarios u ON u.telegram_id = i.de_id
         WHERE i.para_id = ?
-        ORDER BY i.fecha DESC
-        LIMIT 20
+        ORDER BY i.fecha DESC LIMIT 20
     """, (telegram_id,))
-    resultados = c.fetchall()
+    r = c.fetchall()
     conn.close()
-    return resultados
+    return r
+
+def obtener_matches(telegram_id):
+    """Devuelve las personas con las que este usuario tiene Match"""
+    conn = sqlite3.connect("radar_privado.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT u.telegram_id, u.nombre, u.edad, u.busca, u.zona, u.foto_id
+        FROM intereses i1
+        JOIN intereses i2 ON i1.de_id = i2.para_id AND i1.para_id = i2.de_id
+        JOIN usuarios u ON u.telegram_id = i1.para_id
+        WHERE i1.de_id = ?
+    """, (telegram_id,))
+    r = c.fetchall()
+    conn.close()
+    return r
+
+def iniciar_chat(user_id, con_quien):
+    conn = sqlite3.connect("radar_privado.db")
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO chats_activos (user_id, con_quien, fecha) VALUES (?,?,?)",
+              (user_id, con_quien, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def obtener_chat_activo(user_id):
+    conn = sqlite3.connect("radar_privado.db")
+    c = conn.cursor()
+    c.execute("SELECT con_quien FROM chats_activos WHERE user_id=?", (user_id,))
+    r = c.fetchone()
+    conn.close()
+    return r[0] if r else None
+
+def terminar_chat(user_id):
+    conn = sqlite3.connect("radar_privado.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM chats_activos WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,11 +326,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if hay_match(user.id, para_id):
             try:
-                await query.edit_message_caption(caption="🔥 *¡Es un Match!*")
+                await query.edit_message_caption(caption="🔥 *¡Es un Match!*\n\nUsa /chat para hablar.")
             except:
-                await query.edit_message_text("🔥 *¡Es un Match!*")
+                await query.edit_message_text("🔥 *¡Es un Match!*\n\nUsa /chat para hablar.")
             try:
-                await context.bot.send_message(chat_id=para_id, text="🔥 *¡Tienes un Match!*")
+                await context.bot.send_message(
+                    chat_id=para_id,
+                    text="🔥 *¡Tienes un Match!*\n\nUsa /chat para empezar a hablar."
+                )
             except:
                 pass
         else:
@@ -295,9 +346,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ Interés enviado. Si te responden será Match."
                 )
 
+    elif query.data.startswith("chat_con_"):
+        con_quien = int(query.data.split("_")[2])
+        iniciar_chat(user.id, con_quien)
+        await query.edit_message_text(
+            "✅ Chat iniciado.\n\n"
+            "Ya puedes escribir mensajes. Se enviarán de forma anónima.\n"
+            "Escribe /fin cuando quieras terminar el chat."
+        )
+
 async def recibir_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     estado = context.user_data.get("estado")
+
+    # Si tiene un chat activo, reenviar el mensaje
+    con_quien = obtener_chat_activo(user.id)
+    if con_quien and update.message.text and not update.message.text.startswith("/"):
+        try:
+            await context.bot.send_message(
+                chat_id=con_quien,
+                text=f"💬 *Mensaje de tu Match:*\n\n{update.message.text}",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text("✅ Mensaje enviado.")
+        except:
+            await update.message.reply_text("No se pudo enviar el mensaje. El otro usuario pudo haber bloqueado el bot.")
+        return
 
     # Foto
     if update.message.photo and estado == "esperando_foto":
@@ -374,6 +448,41 @@ async def recibir_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    matches = obtener_matches(user.id)
+
+    if not matches:
+        await update.message.reply_text("Todavía no tienes ningún Match.\nSigue explorando con /explorar.")
+        return
+
+    await update.message.reply_text("🔥 *Tus Matches:*\nElige con quién quieres chatear:", parse_mode="Markdown")
+
+    for m in matches:
+        tid, nombre, edad, busca, zona, foto_id = m
+        texto = f"👤 *{nombre}* • {edad} años\nBusca: {busca}\nZona: {zona}"
+        teclado = [[InlineKeyboardButton("💬 Chatear", callback_data=f"chat_con_{tid}")]]
+
+        if foto_id:
+            await update.message.reply_photo(
+                photo=foto_id, caption=texto, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(teclado)
+            )
+        else:
+            await update.message.reply_text(
+                texto, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(teclado)
+            )
+
+async def fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    con_quien = obtener_chat_activo(user.id)
+    if not con_quien:
+        await update.message.reply_text("No tienes ningún chat activo.")
+        return
+    terminar_chat(user.id)
+    await update.message.reply_text("✅ Chat terminado.\nPuedes usar /chat para hablar con otro Match.")
+
 async def perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     datos = obtener_usuario(user.id)
@@ -417,6 +526,31 @@ async def explorar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(teclado)
             )
 
+async def interesados(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not es_premium(user.id):
+        await update.message.reply_text(
+            "⭐ Esta función es solo para usuarios *Premium*.\n\n"
+            "Hazte Premium con /premium para ver quién te ha marcado interés.",
+            parse_mode="Markdown"
+        )
+        return
+    lista = obtener_interesados(user.id)
+    if not lista:
+        await update.message.reply_text("Todavía nadie te ha marcado interés.")
+        return
+    await update.message.reply_text(f"❤️ *Personas que te marcaron interés:* ({len(lista)})", parse_mode="Markdown")
+    for persona in lista:
+        tid, nombre, edad, busca, zona, foto_id = persona
+        texto = f"👤 *{nombre}* • {edad} años\nBusca: {busca}\nZona: {zona}"
+        teclado = [[InlineKeyboardButton("❤️ Me interesa también", callback_data=f"interes_{tid}")]]
+        if foto_id:
+            await update.message.reply_photo(photo=foto_id, caption=texto, parse_mode="Markdown",
+                                             reply_markup=InlineKeyboardMarkup(teclado))
+        else:
+            await update.message.reply_text(texto, parse_mode="Markdown",
+                                            reply_markup=InlineKeyboardMarkup(teclado))
+
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if es_premium(update.effective_user.id):
         await update.message.reply_text("✅ Ya tienes Premium activo.")
@@ -425,7 +559,8 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⭐ *Radar Privado Premium*\n\n"
         "• Intereses ilimitados\n"
         "• Apareces primero\n"
-        "• Más Matches\n\n"
+        "• Ver quién te marcó interés\n"
+        "• Más Matches y chats\n\n"
         "Precio: *$70 MXN / mes*\n\n"
         "Escribe *pago* para ver los datos.",
         parse_mode="Markdown"
@@ -453,49 +588,13 @@ async def activar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-async def interesados(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    if not es_premium(user.id):
-        await update.message.reply_text(
-            "⭐ Esta función es solo para usuarios *Premium*.\n\n"
-            "Hazte Premium con /premium para ver quién te ha marcado interés.",
-            parse_mode="Markdown"
-        )
-        return
-
-    lista = obtener_interesados(user.id)
-
-    if not lista:
-        await update.message.reply_text("Todavía nadie te ha marcado interés.")
-        return
-
-    await update.message.reply_text(f"❤️ *Personas que te marcaron interés:* ({len(lista)})", parse_mode="Markdown")
-
-    for persona in lista:
-        tid, nombre, edad, busca, zona, foto_id = persona
-        texto = f"👤 *{nombre}* • {edad} años\nBusca: {busca}\nZona: {zona}"
-        teclado = [[InlineKeyboardButton("❤️ Me interesa también", callback_data=f"interes_{tid}")]]
-
-        if foto_id:
-            await update.message.reply_photo(
-                photo=foto_id,
-                caption=texto,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(teclado)
-            )
-        else:
-            await update.message.reply_text(
-                texto,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(teclado)
-            )
-
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start - Iniciar\n"
         "/perfil - Ver perfil\n"
         "/explorar - Ver personas\n"
+        "/chat - Chatear con tus Matches\n"
+        "/fin - Terminar chat actual\n"
         "/interesados - Quién me marcó interés (Premium)\n"
         "/premium - Hazte Premium\n"
         "/ayuda - Esta ayuda"
@@ -509,13 +608,16 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("perfil", perfil))
     app.add_handler(CommandHandler("explorar", explorar))
+    app.add_handler(CommandHandler("chat", chat))
+    app.add_handler(CommandHandler("fin", fin))
+    app.add_handler(CommandHandler("interesados", interesados))
     app.add_handler(CommandHandler("premium", premium))
     app.add_handler(CommandHandler("activar", activar))
     app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, recibir_mensaje))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_mensaje))
-    app.add_handler(CommandHandler("interesados", interesados))
+
     print("Bot iniciado correctamente. Presiona Ctrl+C para detenerlo.")
     app.run_polling()
 
