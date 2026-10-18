@@ -217,6 +217,46 @@ def terminar_chat(user_id):
     conn.commit()
     conn.close()
 
+def obtener_estadisticas():
+    conn = sqlite3.connect("radar_privado.db")
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM usuarios")
+    total_usuarios = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM usuarios WHERE es_premium = 1")
+    total_premium = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM intereses")
+    total_intereses = c.fetchone()[0]
+
+    # Matches = pares de intereses mutuos (dividido entre 2 porque cada match se cuenta dos veces)
+    c.execute("""
+        SELECT COUNT(*) FROM intereses i1
+        JOIN intereses i2 ON i1.de_id = i2.para_id AND i1.para_id = i2.de_id
+        WHERE i1.de_id < i1.para_id
+    """)
+    total_matches = c.fetchone()[0]
+
+    # Usuarios de los últimos 7 días
+    hace_7_dias = (datetime.now() - timedelta(days=7)).isoformat()
+    c.execute("SELECT COUNT(*) FROM usuarios WHERE fecha_registro >= ?", (hace_7_dias,))
+    usuarios_7_dias = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM chats_activos")
+    chats_activos = c.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "total_usuarios": total_usuarios,
+        "total_premium": total_premium,
+        "total_intereses": total_intereses,
+        "total_matches": total_matches,
+        "usuarios_7_dias": usuarios_7_dias,
+        "chats_activos": chats_activos
+    }
+
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -302,7 +342,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(texto + "\n\n(Sin foto)", parse_mode="Markdown")
 
     elif query.data == "editar_perfil":
-        # Cerrar chat activo si existe (evita conflicto)
         terminar_chat(user.id)
         context.user_data.clear()
         context.user_data["estado"] = "esperando_edad"
@@ -647,6 +686,24 @@ async def activar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("No tienes permiso para usar este comando.")
+        return
+
+    s = obtener_estadisticas()
+
+    texto = (
+        "📊 *Estadísticas de Radar Privado*\n\n"
+        f"👥 Total de usuarios: *{s['total_usuarios']}*\n"
+        f"⭐ Usuarios Premium: *{s['total_premium']}*\n"
+        f"❤️ Intereses enviados: *{s['total_intereses']}*\n"
+        f"🔥 Matches realizados: *{s['total_matches']}*\n"
+        f"📅 Nuevos últimos 7 días: *{s['usuarios_7_dias']}*\n"
+        f"💬 Chats activos ahora: *{s['chats_activos']}*"
+    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📌 *Comandos disponibles*\n\n"
@@ -674,6 +731,7 @@ def main():
     app.add_handler(CommandHandler("interesados", interesados))
     app.add_handler(CommandHandler("premium", premium))
     app.add_handler(CommandHandler("activar", activar))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, recibir_mensaje))
