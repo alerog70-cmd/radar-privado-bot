@@ -301,15 +301,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text(texto + "\n\n(Sin foto)", parse_mode="Markdown")
 
-   elif query.data == "editar_perfil":
-    # Cerrar chat activo si existe
-    terminar_chat(user.id)
-    context.user_data.clear()
-    context.user_data["estado"] = "esperando_edad"
-    await query.edit_message_text(
-        "Vamos a actualizar tu perfil.\n\n"
-        "¿Cuál es tu edad? (escribe solo el número)"
-    )
+    elif query.data == "editar_perfil":
+        # Cerrar chat activo si existe (evita conflicto)
+        terminar_chat(user.id)
+        context.user_data.clear()
+        context.user_data["estado"] = "esperando_edad"
+        await query.edit_message_text(
+            "Vamos a actualizar tu perfil.\n\n"
+            "¿Cuál es tu edad? (escribe solo el número)"
+        )
 
     elif query.data == "saltar_foto":
         guardar_usuario(
@@ -397,10 +397,9 @@ async def recibir_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     estado = context.user_data.get("estado")
 
     # Chat activo (solo si NO está creando/editando perfil)
-estado = context.user_data.get("estado")
-con_quien = obtener_chat_activo(user.id)
-
-if con_quien and update.message.text and not update.message.text.startswith("/") and estado not in ["esperando_edad", "esperando_busca", "esperando_zona", "esperando_foto"]:
+    con_quien = obtener_chat_activo(user.id)
+    if (con_quien and update.message.text and not update.message.text.startswith("/")
+            and estado not in ["esperando_edad", "esperando_busca", "esperando_zona", "esperando_foto"]):
         try:
             await context.bot.send_message(
                 chat_id=con_quien,
